@@ -2,9 +2,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import torch
+from torchvision.transforms import TenCrop, Resize, CenterCrop, GaussianBlur, RandomRotation, RandomEqualize
+from torchvision.transforms.functional import rotate, equalize
 import skimage.io
-from skimage.transform import rotate
+import random
+from skimage.transform import rotate, AffineTransform, warp
 from skimage.io import imread_collection
+from skimage.util import random_noise
+import elasticdeform.torch as etorch
 
 datadir = 'EM_ISBI_Challenge_modified/'  # path to the directory containing data
 
@@ -12,6 +17,7 @@ datadir = 'EM_ISBI_Challenge_modified/'  # path to the directory containing data
 ### TODO: Changing U-net architecture, Further Augmentation traditional and new, Check original paper for inspiration
 ### TODO: Qualitative and quantitatice analysis of results
 ### TODO: Use baseline model to create psudo-prediciton labels for unlabeled test data, compare with our result
+### TODO: Maybe compare our model output with true labels on a pixel basis, how far is the image vector from true vector
 
 
 # Make dataset class.
@@ -29,18 +35,89 @@ class Data(torch.utils.data.Dataset):
 
         self.images.shape += (1,)
         self.images = torch.from_numpy(np.double(self.images)).permute(0, 3, 1, 2)
-
+        # print(self.labels.shape)
+        fig, ax = plt.subplots(2,2)
+        fig.set_tight_layout(True)
+        ax[0, 0].imshow(self.images[0, 0], cmap="gray")
+        # ax[0, 0].imshow(self.labels[0])
+        ax[0,0].axis('off')
         if augment:
-            aug3 = torch.flip(self.images, [1])
-            aug4 = torch.flip(self.images, [2])
-            aug5 = torch.flip(self.images, [1, 2])
+            aug3 = torch.flip(self.images, [2])
+            aug4 = torch.flip(self.images, [3])
+            aug5 = torch.flip(self.images, [2, 3])
             lab3 = torch.flip(self.labels, [1])
             lab4 = torch.flip(self.labels, [2])
             lab5 = torch.flip(self.labels, [1, 2])
             aug_list = [aug3, aug4, aug5]
             lab_list = [lab3, lab4, lab5]
+
+
+            # tencrop_im = Resize(512)(torch.cat(CenterCrop(512/2)(self.images)))
+            # tencrop_lab = Resize(472)(torch.cat(CenterCrop(512/2)(self.labels)))
+            # print(self.images.shape)
+            # print(tencrop_im.shape)
+            # print(tencrop_lab.shape)
+
             self.images = torch.cat((self.images, aug3, aug4, aug5))
             self.labels = torch.cat((self.labels, lab3, lab4, lab5))
+            # self.images = torch.cat((self.images, tencrop_im))
+            # self.labels = torch.cat((self.labels, tencrop_lab))
+            new_images = []
+            new_labels = []
+            for im, lab in zip(self.images, self.labels):
+
+                choice = random.randint(1,3)
+                # rotate
+                if choice == 1:
+                    angle = random.randint(-180,180)
+                    rotated_im = torch.tensor(rotate(im, angle=angle, mode='wrap'))
+                    rotated_lab = torch.tensor(rotate(lab, angle=angle, mode='wrap'))
+                    new_images.append(rotated_im)
+                    new_labels.append(rotated_lab)
+
+                # shift
+                elif choice == 2:
+                    a, b = random.randint(1, self.images.shape[-1]), random.randint(1, self.images.shape[-1])
+                    transform = AffineTransform(translation=(a, b))
+                    warped_im = torch.tensor(warp(im, transform, mode='wrap'))
+                    warped_lab = torch.tensor(warp(lab, transform, mode='wrap'))
+                    new_images.append(warped_im)
+                    new_labels.append(warped_lab)
+
+
+                # print(ok.shape)
+                elif choice == 3:
+                    displacement_val = np.random.randn(2, 3, 3) * 5
+                    displacement = torch.tensor(displacement_val)
+                    im_deformed = torch.unsqueeze(torch.tensor(etorch.deform_grid(im[0], displacement, order=3)), dim=0)
+                    lab_deformed = torch.tensor(etorch.deform_grid(lab, displacement, order=3))
+                    new_images.append(im_deformed)
+                    new_labels.append(lab_deformed)
+                #
+                # new_images.extend([rotated_im, warped_im])#, im_deformed])
+                # new_labels.extend([rotated_lab, warped_lab])#, lab_deformed])
+                # new_images.extend([im_deformed])
+                # new_labels.extend([lab_deformed])
+                # print()
+
+            # print(self.images.shape)
+            # print(torch.stack(new_images).shape)
+            self.images = torch.cat((self.images, torch.stack(new_images)))
+            self.labels = torch.cat((self.labels, torch.stack(new_labels)))
+            #
+            # self.images = RandomEqualize(1)(self.images)
+
+
+            ax[1, 0].imshow(aug3[0, 0], cmap="gray")
+            # ax[1, 0].imshow(lab3[0])
+            ax[1, 0].axis('off')
+            ax[0, 1].imshow(aug4[0, 0], cmap="gray")
+            # ax[0, 1].imshow(lab4[0])
+            ax[0, 1].axis('off')
+            ax[1, 1].imshow(aug5[0, 0], cmap="gray")
+            # ax[1, 1].imshow(lab5[0])
+            ax[1, 1].axis('off')
+            plt.savefig('original_augmentation.png')
 
     def __getitem__(self, idx):
         return self.images[idx], self.labels[idx]
@@ -85,7 +162,7 @@ class UNet128(torch.nn.Module):
         # Convenience
         self.relu = torch.nn.ReLU()
         self.pool = torch.nn.MaxPool2d(2, 2)
-        self.dropout = torch.nn.Dropout(0.5)
+        self.dropout = torch.nn.Dropout(0.3)
 
     def forward(self, x):
         # Down, keeping layer outputs we'll need later.
@@ -118,15 +195,16 @@ else:
 # Initiate the model, dataloaders and optimizer.
 
 lr = 0.001
-nr_epochs = 250
+nr_epochs = 100
+
 
 #  Loaders for training and testing set
 trainloader = torch.utils.data.DataLoader(TrainData,
                                           batch_size=32,
                                           shuffle=True,
                                           drop_last=True)
-testloader = torch.utils.data.DataLoader(ValData,
-                                          batch_size=20)
+valloader = torch.utils.data.DataLoader(ValData,
+                                          batch_size=6)
 model = UNet128().to(device)
 
 loss_function = torch.nn.CrossEntropyLoss()
@@ -152,6 +230,7 @@ plt.show()
 epoch_losses = []
 batch_losses = []
 test_losses = []
+iou_scores = []
 
 # Train.
 for epoch in range(nr_epochs):
@@ -175,34 +254,45 @@ for epoch in range(nr_epochs):
     epoch_losses.append(epoch_loss / len(trainloader))
     print(f', loss {epoch_losses[-1]}')
 
-    if epoch % 25 == 0:
-        #  Book-keeping and visualizing every tenth iterations
-        with torch.no_grad():
-            lgt = model(im.unsqueeze(0).to(device, dtype=torch.float))
-            test_loss = 0
-            for batch in testloader:
-                image_batch, label_batch = batch  # unpack the data
-                image_batch = image_batch.to(device, dtype=torch.float)
-                label_batch = label_batch.to(device, dtype=torch.long)
-                logits_batch = model(image_batch)
-                loss = loss_function(logits_batch, label_batch)
-                test_loss += loss.item()
-            test_losses.append(test_loss / len(testloader))
-
-        prob = torch.nn.Softmax(dim=1)(lgt)
-
-        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
-        ax[0].imshow(prob[0, 1].cpu().detach())
-        ax[0].set_title(f'Prediction, epoch:{len(epoch_losses) - 1}')
-
-        ax[1].plot(np.linspace(0, len(epoch_losses), len(batch_losses)),
-                   batch_losses, lw=0.5)
-        ax[1].plot(np.arange(len(epoch_losses)) + 0.5, epoch_losses, lw=2)
-        ax[1].plot(np.linspace(9.5, len(epoch_losses) - 0.5, len(test_losses)),
-                   test_losses, lw=1)
-        ax[1].set_title('Batch loss, epoch loss (training) and test loss')
-        ax[1].set_ylim(0, 1.1 * max(epoch_losses + test_losses))
-        plt.show()
+    # if epoch % 25 == 0:
+    #     #  Book-keeping and visualizing every tenth iterations
+    #     with torch.no_grad():
+    #         lgt = model(im.unsqueeze(0).to(device, dtype=torch.float))
+    #         test_loss = 0
+    #         for batch in valloader:
+    #             image_batch, label_batch = batch  # unpack the data
+    #             image_batch = image_batch.to(device, dtype=torch.float)
+    #             label_batch = label_batch.to(device, dtype=torch.long)
+    #             logits_batch = model(image_batch)
+    #             loss = loss_function(logits_batch, label_batch)
+    #             test_loss += loss.item()
+    #
+    #             prob_pred = torch.nn.Softmax(dim=1)(logits_batch)
+    #             pred = prob_pred.argmax(axis=1)
+    #             intersection = torch.logical_and(label_batch, pred)
+    #             union = torch.logical_or(label_batch, pred)
+    #             iou_score = torch.sum(intersection) / torch.sum(union)
+    #
+    #         test_losses.append(test_loss / len(valloader))
+    #         iou_scores.append(iou_score.item())
+    #
+    #     prob = torch.nn.Softmax(dim=1)(lgt)
+    #
+    #
+    #     fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+    #     ax[0].imshow(prob[0, 1].cpu().detach())
+    #     ax[0].set_title(f'Prediction, epoch:{len(epoch_losses) - 1}')
+    #
+    #     ax[1].plot(np.linspace(0, len(epoch_losses), len(batch_losses)),
+    #                batch_losses, lw=0.5)
+    #     ax[1].plot(np.arange(len(epoch_losses)) + 0.5, epoch_losses, lw=2)
+    #     ax[1].plot(np.linspace(9.5, len(epoch_losses) - 0.5, len(test_losses)),
+    #                test_losses, lw=1)
+    #     ax[1].plot(np.linspace(9.5, len(epoch_losses) - 0.5, len(iou_scores)),
+    #                iou_scores, lw=1)
+    #     ax[1].set_title('Batch loss, epoch loss (training) and test loss')
+    #     ax[1].set_ylim(0, 1.1 * max(epoch_losses + test_losses))
+    #     plt.show()
 
 # %%  Show predictions for a few images from the test set.
 
@@ -219,8 +309,8 @@ for n, idx in enumerate(idxs):
     ax[0, n].imshow(im_val.permute(1, 2, 0))
     ax[1, n].imshow(lb_val)
     res = prob_val[0, 1].cpu().detach()
-    res[res > 0.7] = 1
-    res[res <= 0.7] = 0
+    # res[res > 0.5] = 1
+    # res[res <= 0.5] = 0
     ax[2, n].imshow(res)
 fig.suptitle('Test images, labels and predictions')
 plt.show()
